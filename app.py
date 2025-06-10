@@ -1,4 +1,3 @@
-##apiKey = "AIzaSyCX-9XgCBS9GS9WGOp0_3tVjryAn3Koj3Y"
 import os
 import io
 from flask import Flask, request, jsonify, render_template
@@ -6,19 +5,21 @@ import google.generativeai as genai
 from docx import Document
 import openpyxl
 import pandas as pd
-from PyPDF2 import PdfReader # Updated for newer PyPDF2 versions
+from PyPDF2 import PdfReader
+
+# PII Redaction Imports
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
 
 app = Flask(__name__)
 
 # Configure your Gemini API key
-# It's recommended to set this as an environment variable for security
-# For development, you can directly paste it here, but remove it for production
-# genai.configure(api_key="YOUR_GEMINI_API_KEY")
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-#genai.configure(api_key=apiKey)
+
 # Initialize the Gemini model
 generation_config = {
-    "temperature": 0.2, # Lower temperature for more focused and less random output
+    "temperature": 0.2,
     "top_p": 1,
     "top_k": 32,
     "max_output_tokens": 4096,
@@ -37,15 +38,78 @@ model = genai.GenerativeModel(
     safety_settings=safety_settings
 )
 
+# Initialize Presidio Analyzer and Anonymizer
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+
+def anonymize_text_with_presidio(text):
+    """
+    Detects PII in the given text and anonymizes it using Presidio.
+    Replaces detected PII with entity type placeholders (e.g., <PERSON>).
+    """
+    if not text or not text.strip():
+        return ""
+
+    try:
+        results = analyzer.analyze(text=text, language='en')
+
+        # Filter out DATE_TIME and IN_PAN entities from the results so they are not anonymized
+        filtered_results = [
+            result for result in results 
+            if result.entity_type != "DATE_TIME" and result.entity_type != "IN_PAN"
+        ]
+
+        anonymized_text = anonymizer.anonymize(
+            text=text,
+            analyzer_results=filtered_results, # Use filtered results
+            operators={
+                "PERSON": OperatorConfig("replace", {"new_value": "<PERSON>"}),
+                "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "<EMAIL_ADDRESS>"}),
+                "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "<PHONE_NUMBER>"}),
+                "STREET_ADDRESS": OperatorConfig("replace", {"new_value": "<ADDRESS>"}),
+                "LOCATION": OperatorConfig("replace", {"new_value": "<LOCATION>"}),
+                "ORG": OperatorConfig("replace", {"new_value": "<ORGANIZATION>"}),
+                # DATE_TIME and IN_PAN are now excluded at the filtering step,
+                # so no operator config is needed for them here.
+            }
+        )
+        print("--- Original Text (Snippet) ---")
+        print(text[:500] + "...")
+        print("\n--- Anonymized Text (PII Redacted Snippet) ---")
+        print(anonymized_text.text[:500] + "...")
+        return anonymized_text.text
+    except Exception as e:
+        print(f"Error during PII anonymization: {e}")
+        return text
+
+# --- Existing text extraction functions (no changes needed here) ---
 def extract_text_from_pdf(file_stream):
     """Extracts text from a PDF file."""
     text = ""
     try:
         reader = PdfReader(file_stream)
-        for page in reader.pages:
-            text += page.extract_text() or ""
+        if reader.is_encrypted:
+            print("PDF is encrypted. Please provide a non-encrypted PDF.")
+            return ""
+
+        if not reader.pages:
+            print("PDF has no pages or failed to read pages.")
+            return ""
+
+        for page_num, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+            else:
+                print(f"Warning: No text extracted from page {page_num + 1}. This might be an image-based page.")
+        
+        if not text.strip():
+            print("No text extracted from the entire PDF. It might be entirely image-based or empty.")
+
+    except PdfReadError as e:
+        print(f"PyPDF2 Read Error: {e}. The PDF might be corrupted or malformed.")
     except Exception as e:
-        print(f"Error extracting text from PDF: {e}")
+        print(f"General Error extracting text from PDF: {e}")
     return text
 
 def extract_text_from_docx(file_stream):
@@ -119,40 +183,68 @@ def extract_entities():
         if not extracted_text.strip():
             return jsonify({"error": "Could not extract text from the document. The document might be empty or in an unsupported format."}), 400
 
-        print(f"extracted text : {extracted_text}")
-        # Construct the prompt for the Gemini model
+        redacted_text = anonymize_text_with_presidio(extracted_text)
+
+        # --- REFINED PROMPT FOR DIRECT KEY-VALUE PAIRS ---
         prompt = f"""
-        Analyze the following document text and extract all relevant entities.
-        Represent each entity as a key-value pair.
-        Focus on identifying names, organizations, dates, locations, products, prices, contact information (emails, phone numbers), invoice numbers, and any other significant factual information.
-        If a value is a list (e.g., multiple products mentioned), represent it as a JSON array.
-        If an entity is clearly associated with a type (e.g., "Company Name", "Invoice Number"), use that as the key.
-        
+        You are an expert in extracting structured information from documents.
+        Extract all relevant entities from the following document text and return them as a single JSON object.
+        Each entity should be a direct key-value pair within the JSON object.
+
+        - For a clear "Key: Value" pair (e.g., "Job Title: Software Engineer"), use the "Key" as the JSON field name and the "Value" as its corresponding value.
+        - For a standalone entity (e.g., a company name), choose an appropriate field name (e.g., "Company Name") and use the entity as its value.
+        - IMPORTANT for PII: If an entity in the document text is a redacted PII placeholder (e.g., <PERSON>, <EMAIL_ADDRESS>, <PHONE_NUMBER>, <ADDRESS>, <LOCATION>, <ORGANIZATION>), you MUST extract it.
+            - If it comes with an explicit label (e.g., "Employee Name: <PERSON>"), use that label as the JSON field name (e.g., "Employee Name") and the placeholder as its value (e.g., "<PERSON>").
+            - If it's a standalone placeholder (e.g., just "<EMAIL_ADDRESS>"), choose an appropriate field name (e.g., "Contact Email") and use the placeholder itself as its value (e.g., "<EMAIL_ADDRESS>").
+            - Do NOT try to infer or recreate the original PII. The placeholder IS the value.
+        - IMPORTANT for Dates: Date entities will *not* be redacted. Extract them directly as they appear.
+
+        If there are multiple distinct records (e.g., multiple employees in a timesheet), generate a JSON array of objects, where each object represents a record. If it's a single document with overall entities (like an offer letter), generate a single JSON object.
+
+        Examples of desired JSON structure:
+        // For a single document (e.g., Offer Letter):
+        {{
+            "Job Title": "Software Engineer",
+            "Company Name": "<ORGANIZATION>",
+            "Employee Name": "<PERSON>",
+            "Start Date": "July 7, 2025", // DATE is now extracted as plain text
+            "Contact Email": "<EMAIL_ADDRESS>",
+            "Company Address": "<ADDRESS>",
+            "Office Location": "<LOCATION>",
+            "Company Phone": "<PHONE_NUMBER>",
+            "Base Salary": "$125,000 per year"
+        }}
+
+        // For multiple records (e.g., a Timesheet Summary with multiple entries):
+        [
+            {{
+                "Employee Name": "<PERSON>",
+                "Total Hours": "40",
+                "Week Ending": "June 7, 2025" // DATE is now extracted as plain text
+            }},
+            {{
+                "Employee Name": "<PERSON>",
+                "Total Hours": "38",
+                "Week Ending": "June 14, 2025" // DATE is now extracted as plain text
+            }}
+        ]
+
+        Ensure the output is a valid JSON object or array of objects.
+
         Document Text:
         ---
-        {extracted_text}
+        {redacted_text}
         ---
 
-        Provide the output as a JSON object, where keys are entity types or names, and values are the extracted entities.
-        Example format:
-        {{
-        "Name": "John Doe",
-        "Organization": "Acme Corp",
-        "Date": "2023-10-26",
-        "Invoice Number": "INV-2023-001",
-        "Items": ["Product A", "Service B"],
-        "Total Amount": "$150.00"
-        }}
+        JSON Output:
         """
+        # --- END REFINED PROMPT FOR DIRECT KEY-VALUE PAIRS ---
 
         try:
-            # Send the prompt to the Gemini model
             response = model.generate_content(prompt)
-            # The model might return extra text before/after the JSON.
-            # We need to find the actual JSON string.
+            
             response_text = response.text.strip()
-            print(f"model_response: {response_text}")
-            # Attempt to parse the JSON, sometimes the model might add markdown ```json around it
+
             if response_text.startswith("```json") and response_text.endswith("```"):
                 json_string = response_text[7:-3].strip()
             else:
@@ -168,14 +260,8 @@ def extract_entities():
     return jsonify({"error": "An unknown error occurred"}), 500
 
 if __name__ == '__main__':
-    # Ensure your API key is set as an environment variable
-    # For example: export GEMINI_API_KEY="YOUR_API_KEY_HERE"
-    # or set it directly in your system's environment variables.
     if not os.environ.get("GEMINI_API_KEY"):
         print("WARNING: GEMINI_API_KEY environment variable not set.")
         print("Please set it before running the application.")
         print("Example: export GEMINI_API_KEY='your_api_key_here'")
-        # For demonstration, you might temporarily hardcode it here, but DO NOT do this in production.
-        # genai.configure(api_key="YOUR_ACTUAL_GEMINI_API_KEY") # Only for quick testing
     app.run(debug=True)
-

@@ -31,7 +31,7 @@ safety_settings = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
-
+#apikey = "AIzaSyCX-9XgCBS9GS9WGOp0_3tVjryAn3Koj3Y"
 model = genai.GenerativeModel(
     model_name="gemini-1.5-flash",
     generation_config=generation_config,
@@ -73,10 +73,10 @@ def anonymize_text_with_presidio(text):
                 # so no operator config is needed for them here.
             }
         )
-        print("--- Original Text (Snippet) ---")
-        print(text[:500] + "...")
-        print("\n--- Anonymized Text (PII Redacted Snippet) ---")
-        print(anonymized_text.text[:500] + "...")
+        # print("--- Original Text (Snippet) ---")
+        # print(text[:500] + "...")
+        # print("\n--- Anonymized Text (PII Redacted Snippet) ---")
+        # print(anonymized_text.text[:500] + "...")
         return anonymized_text.text
     except Exception as e:
         print(f"Error during PII anonymization: {e}")
